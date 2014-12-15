@@ -12,6 +12,7 @@ import (
 	"time"
 )
 
+//generate mongodb uri , use ip,port,username and password
 func GenMongoDBUri(addr, userName, passWord string) string {
 	var mongoDBUri string
 	if userName == "" || passWord == "" {
@@ -22,16 +23,16 @@ func GenMongoDBUri(addr, userName, passWord string) string {
 	return mongoDBUri
 }
 
-var DoShardCollection bool
-var DoOplogSync bool
+var DoShardCollection bool // if true,do shard and pre split,movechunk in dest mongos
+var DoOplogSync bool       // if true,apply oplog during copy data
 var LastOpTs bson.MongoTimestamp
 var connTimeOut time.Duration
 
-var chunkQueueLock sync.Mutex
+var chunkQueueLock sync.Mutex // channel does not have timeout or getNoWait,use this lock,check whether empty first before get.
 
 var logFile *os.File
 var logger *log.Logger
-var oplogSyncTs map[string]bson.MongoTimestamp
+var oplogSyncTs map[string]bson.MongoTimestamp // while syncing oplog,each replset delay ts
 
 type InitCollection struct {
 	src           string
@@ -110,6 +111,7 @@ func (i *InitCollection) GetSrcDestType() {
 	}
 }
 
+//only src and dest are ALL mongos AND src ns sharded,then do shard on dest ns
 func (i *InitCollection) ShouldDoShardCollection() {
 	if i.srcIsMongos && i.destIsMongos {
 		command := bson.M{"collStats": i.srcColl}
@@ -140,6 +142,7 @@ func (i *InitCollection) ShouldDoShardCollection() {
 	}
 }
 
+// select a node which has no slaveDelay and better to be secondary if possible
 func (i *InitCollection) SelectOplogSyncNode(nodes string) string {
 	var selectNode string
 	var hosts string
@@ -200,6 +203,7 @@ func (i *InitCollection) SelectOplogSyncNode(nodes string) string {
 
 }
 
+// if one replset available to src ns,do oplog sync
 func (i *InitCollection) ShouldDoOplogSync() {
 	if i.srcIsMongos {
 		query := bson.M{}
@@ -238,6 +242,7 @@ func (i *InitCollection) ShouldDoOplogSync() {
 
 }
 
+// when moveing chunk,select a random shard name
 func (i *InitCollection) GetRandomShard() string {
 	var randomShardId string
 	srcShardsNum := len(i.srcOplogNodes)
@@ -260,6 +265,7 @@ func (i *InitCollection) SetStepSign() {
 	i.ShouldDoOplogSync()
 }
 
+// do shard on dest ns
 func (i *InitCollection) ShardDestCollection() {
 	logger.Println("start sharding dest collection")
 	var result, command bson.M
@@ -272,6 +278,7 @@ func (i *InitCollection) ShardDestCollection() {
 	}
 }
 
+// pre split and move chunks
 func (i *InitCollection) PreAllocChunks() {
 	logger.Println("start pre split and move chunks")
 	rand.Seed(time.Now().UnixNano())
@@ -323,6 +330,8 @@ func NewCopyData(i *InitCollection, findAndInsertWorkerNum int) *CopyData {
 	return &CopyData{workerNum: findAndInsertWorkerNum, baseInitCollection: i}
 }
 
+// when doing find and insert , we use many goroutine , each goroutine copy one range of data,
+// we use the first key of shardkey as the query condition
 func (c *CopyData) GetQueryKey() {
 	if c.baseInitCollection.srcIsSharded {
 		logger.Println("select the first key of shardkey as query condition.")
@@ -333,6 +342,7 @@ func (c *CopyData) GetQueryKey() {
 	logger.Println("query condition key is : ", c.queryKey)
 }
 
+// one goroutine,find and insert data
 func (c *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
 	srcMongoUri := GenMongoDBUri(c.baseInitCollection.src, c.baseInitCollection.srcUserName, c.baseInitCollection.srcPassWord)
 	destMongoUri := GenMongoDBUri(c.baseInitCollection.dest, c.baseInitCollection.destUserName, c.baseInitCollection.destPassWord)
@@ -342,7 +352,7 @@ func (c *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
 	destCollConn := destClient.DB(c.baseInitCollection.destDB).C(c.baseInitCollection.destColl)
 	var query bson.M
 	for {
-		chunkQueueLock.Lock()
+		chunkQueueLock.Lock() // as read from channel has no wait time or no wait get,we use one lock here,check whether the queue is empty
 		if len(chunkQueue) == 0 {
 			chunkQueueLock.Unlock()
 			break
@@ -360,9 +370,10 @@ func (c *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
 	ch <- 1
 }
 
+// make query queue,start copy goroutine
 func (c *CopyData) StartCopyData() {
 	chunkQueue := make(chan bson.M, len(c.queryChunk))
-	tmpChunkFilter := make(map[interface{}]bool)
+	tmpChunkFilter := make(map[interface{}]bool) // in case copy same chunk(as _id is unique,will not cause error,but waste time)
 	for _, queryRange := range c.queryChunk {
 		query := bson.M{c.queryKey: bson.M{"$gte": queryRange["min"], "$lt": queryRange["max"]}}
 		if tmpChunkFilter[queryRange["min"]] == false {
@@ -416,6 +427,7 @@ func (c *CopyData) GetQueyRange() {
 	logger.Println("get query key range finished,multi conn copy data will be faster.")
 }
 
+// *bug:* text index create fail.
 func (c *CopyData) BuildIndexes() {
 	logger.Println("start build indexes")
 	indexes, _ := c.baseInitCollection.srcCollConn.Indexes()
@@ -431,6 +443,7 @@ func (c *CopyData) BuildIndexes() {
 	logger.Println("build index fnished.")
 }
 
+// find the smallest ts and save it(as oplog can be ran many times).
 func (c *CopyData) SaveLastOpTs() {
 	logger.Println("save last ts in oplog,use it when syncing oplog.")
 	chs := make([]chan bson.MongoTimestamp, len(c.baseInitCollection.srcOplogNodes))
@@ -508,7 +521,9 @@ func (o *OplogSync) StartOplogSync(node string) {
 	mongoUri := GenMongoDBUri(node, o.baseInitCollection.srcUserName, o.baseInitCollection.srcPassWord)
 	mongoClient, _ := mgo.Dial(mongoUri)
 	var result bson.M
-	oplogIter := mongoClient.DB("local").C("oplog.rs").Find(bson.M{"ts": bson.M{"$gte": LastOpTs}, "ns": o.baseInitCollection.srcDB + "." + o.baseInitCollection.srcColl, "fromMigrate": bson.M{"$exists": false}}).Sort("$natural").LogReplay().Tail(-1)
+
+	// dont use OPLOG_REPLAY here,just be careful
+	oplogIter := mongoClient.DB("local").C("oplog.rs").Find(bson.M{"ts": bson.M{"$gte": LastOpTs}, "ns": o.baseInitCollection.srcDB + "." + o.baseInitCollection.srcColl, "fromMigrate": bson.M{"$exists": false}}).Sort("$natural").Tail(-1)
 	oplogSyncTs[node] = LastOpTs
 	for oplogIter.Next(&result) {
 		if ts, ok := result["ts"].(bson.MongoTimestamp); ok {
