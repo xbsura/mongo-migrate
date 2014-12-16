@@ -21,5 +21,10 @@
 --destPassWord "password" 目标 auth 密码
 --findAndInsertWorkerNum 10 拷贝数据时并发读写goroutine 数目
 
+--writeAck 1 "same with w param in other driver"
+--writeMode "Majority" "see mongodb doc if needed"
+--journal  true "whether use journal"
+--fsync false "whether wait for fsync for each write"
+
 ## 已知 bug
 1. 拷贝索引时,文本索引不能正常建立
