@@ -4,6 +4,7 @@ import (
 	"flag"
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -45,6 +46,10 @@ type InitCollection struct {
 	destColl      string
 	destUserName  string
 	destPassWord  string
+	writeAck      int
+	writeMode     string
+	journal       bool
+	fsync         bool
 	srcClient     *mgo.Session
 	destClient    *mgo.Session
 	srcDBConn     *mgo.Database
@@ -59,52 +64,52 @@ type InitCollection struct {
 	srcChunks     []bson.M
 }
 
-func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string) *InitCollection {
-	i := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil}
-	i.srcOplogNodes = make(map[string]string)
-	return i
+func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string, writeAck int, writeMode string, fsync, journal bool) *InitCollection {
+	initCollection := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil}
+	initCollection.srcOplogNodes = make(map[string]string)
+	return initCollection
 }
 
-func (i *InitCollection) InitConn() {
-	srcMongoUri := GenMongoDBUri(i.src, i.srcUserName, i.srcPassWord)
-	destMongoUri := GenMongoDBUri(i.dest, i.destUserName, i.destPassWord)
+func (initCollection *InitCollection) InitConn() {
+	srcMongoUri := GenMongoDBUri(initCollection.src, initCollection.srcUserName, initCollection.srcPassWord)
+	destMongoUri := GenMongoDBUri(initCollection.dest, initCollection.destUserName, initCollection.destPassWord)
 
 	var err error
 
-	i.srcClient, err = mgo.DialWithTimeout(srcMongoUri, connTimeOut)
+	initCollection.srcClient, err = mgo.DialWithTimeout(srcMongoUri, connTimeOut)
 	if err != nil {
-		logger.Fatal("connect src failed.")
+		logger.Panicln("connect src failed.")
 	} else {
 		logger.Println("connect src success.")
 	}
 
-	i.destClient, err = mgo.DialWithTimeout(destMongoUri, connTimeOut)
+	initCollection.destClient, err = mgo.DialWithTimeout(destMongoUri, connTimeOut)
 	if err != nil {
-		logger.Fatal("connect dest failed.")
+		logger.Panicln("connect dest failed.")
 	} else {
 		logger.Println("connect src success.")
 	}
 
-	i.srcDBConn = i.srcClient.DB(i.srcDB)
-	i.srcCollConn = i.srcDBConn.C(i.srcColl)
+	initCollection.srcDBConn = initCollection.srcClient.DB(initCollection.srcDB)
+	initCollection.srcCollConn = initCollection.srcDBConn.C(initCollection.srcColl)
 
-	i.destDBConn = i.destClient.DB(i.destDB)
-	i.destCollConn = i.destDBConn.C(i.destColl)
+	initCollection.destDBConn = initCollection.destClient.DB(initCollection.destDB)
+	initCollection.destCollConn = initCollection.destDBConn.C(initCollection.destColl)
 }
 
-func (i *InitCollection) GetSrcDestType() {
+func (initCollection *InitCollection) GetSrcDestType() {
 	command := bson.M{"isMaster": 1}
 	result := bson.M{}
-	i.srcDBConn.Run(command, &result)
+	initCollection.srcDBConn.Run(command, &result)
 	if result["msg"] == "isdbgrid" {
-		i.srcIsMongos = true
+		initCollection.srcIsMongos = true
 		logger.Println("src is mongos")
 	} else {
 		logger.Println("src is not mongos,may be mongod.")
 	}
-	i.destDBConn.Run(command, &result)
+	initCollection.destDBConn.Run(command, &result)
 	if result["msg"] == "isdbgrid" {
-		i.destIsMongos = true
+		initCollection.destIsMongos = true
 		logger.Println("dest is mongos")
 	} else {
 		logger.Println("dest is not mongos,may be mongod.")
@@ -112,23 +117,23 @@ func (i *InitCollection) GetSrcDestType() {
 }
 
 //only src and dest are ALL mongos AND src ns sharded,then do shard on dest ns
-func (i *InitCollection) ShouldDoShardCollection() {
-	if i.srcIsMongos && i.destIsMongos {
-		command := bson.M{"collStats": i.srcColl}
+func (initCollection *InitCollection) ShouldDoShardCollection() {
+	if initCollection.srcIsMongos && initCollection.destIsMongos {
+		command := bson.M{"collStats": initCollection.srcColl}
 		result := bson.M{}
-		i.srcDBConn.Run(command, &result)
+		initCollection.srcDBConn.Run(command, &result)
 		srcIsSharded, _ := result["sharded"]
 		if srcIsSharded == true {
 			DoShardCollection = true
-			i.srcIsSharded = true
-			query := bson.M{"_id": i.srcDB + "." + i.srcColl}
+			initCollection.srcIsSharded = true
+			query := bson.M{"_id": initCollection.srcDB + "." + initCollection.srcColl}
 			var result bson.D
-			i.srcClient.DB("config").C("collections").Find(query).One(&result)
+			initCollection.srcClient.DB("config").C("collections").Find(query).One(&result)
 			for _, doc := range result {
 				if doc.Name == "key" {
 					if key, ok := doc.Value.(bson.D); ok {
-						i.srcShardKey = key
-						logger.Println("dest ns sharded,and shardkey is", i.srcShardKey)
+						initCollection.srcShardKey = key
+						logger.Println("dest ns sharded,and shardkey is", initCollection.srcShardKey)
 						break
 					}
 				}
@@ -143,7 +148,7 @@ func (i *InitCollection) ShouldDoShardCollection() {
 }
 
 // select a node which has no slaveDelay and better to be secondary if possible
-func (i *InitCollection) SelectOplogSyncNode(nodes string) string {
+func (initCollection *InitCollection) SelectOplogSyncNode(nodes string) string {
 	var selectNode string
 	var hosts string
 	if strings.Contains(nodes, "/") {
@@ -159,7 +164,7 @@ func (i *InitCollection) SelectOplogSyncNode(nodes string) string {
 		host = hosts
 	}
 
-	mongoUri := GenMongoDBUri(host, i.srcUserName, i.srcPassWord)
+	mongoUri := GenMongoDBUri(host, initCollection.srcUserName, initCollection.srcPassWord)
 
 	mongoClient, _ := mgo.Dial(mongoUri)
 
@@ -204,11 +209,11 @@ func (i *InitCollection) SelectOplogSyncNode(nodes string) string {
 }
 
 // if one replset available to src ns,do oplog sync
-func (i *InitCollection) ShouldDoOplogSync() {
-	if i.srcIsMongos {
+func (initCollection *InitCollection) ShouldDoOplogSync() {
+	if initCollection.srcIsMongos {
 		query := bson.M{}
 		var result bson.M
-		shardsColl := i.srcClient.DB("config").C("shards")
+		shardsColl := initCollection.srcClient.DB("config").C("shards")
 		shards := shardsColl.Find(query).Iter()
 		var valueId, valueHost string
 		var ok bool
@@ -218,21 +223,21 @@ func (i *InitCollection) ShouldDoOplogSync() {
 					DoOplogSync = true
 				}
 				if valueId, ok = result["_id"].(string); ok {
-					i.srcOplogNodes[valueId] = i.SelectOplogSyncNode(valueHost)
+					initCollection.srcOplogNodes[valueId] = initCollection.SelectOplogSyncNode(valueHost)
 				}
 			}
 		}
 	} else {
-		count, _ := i.srcClient.DB("local").C("system.replset").Find(bson.M{}).Count()
+		count, _ := initCollection.srcClient.DB("local").C("system.replset").Find(bson.M{}).Count()
 		if count != 0 {
 			DoOplogSync = true
-			i.srcOplogNodes["shard"] = i.SelectOplogSyncNode(i.src)
+			initCollection.srcOplogNodes["shard"] = initCollection.SelectOplogSyncNode(initCollection.src)
 		} else {
 			DoOplogSync = false
 		}
 	}
 
-	logger.Println("src oplog nodes:", i.srcOplogNodes)
+	logger.Println("src oplog nodes:", initCollection.srcOplogNodes)
 
 	if DoOplogSync {
 		logger.Println("do oplog sync as at least one replset deployed.")
@@ -243,12 +248,12 @@ func (i *InitCollection) ShouldDoOplogSync() {
 }
 
 // when moveing chunk,select a random shard name
-func (i *InitCollection) GetRandomShard() string {
+func (initCollection *InitCollection) GetRandomShard() string {
 	var randomShardId string
-	srcShardsNum := len(i.srcOplogNodes)
+	srcShardsNum := len(initCollection.srcOplogNodes)
 	randomNum := rand.Intn(srcShardsNum)
 	k := 0
-	for shardId, _ := range i.srcOplogNodes {
+	for shardId, _ := range initCollection.srcOplogNodes {
 		if randomNum == k {
 			randomShardId = shardId
 			break
@@ -259,97 +264,98 @@ func (i *InitCollection) GetRandomShard() string {
 	return randomShardId
 }
 
-func (i *InitCollection) SetStepSign() {
-	i.GetSrcDestType()
-	i.ShouldDoShardCollection()
-	i.ShouldDoOplogSync()
+func (initCollection *InitCollection) SetStepSign() {
+	initCollection.GetSrcDestType()
+	initCollection.ShouldDoShardCollection()
+	initCollection.ShouldDoOplogSync()
 }
 
 // do shard on dest ns
-func (i *InitCollection) ShardDestCollection() {
+func (initCollection *InitCollection) ShardDestCollection() {
 	logger.Println("start sharding dest collection")
 	var result, command bson.M
-	command = bson.M{"enableSharding": i.destDB}
-	i.destClient.DB("admin").Run(command, &result)
-	command = bson.M{"shardCollection": i.destDB + "." + i.destColl, "key": i.srcShardKey}
-	err := i.destClient.DB("admin").Run(command, &result)
+	command = bson.M{"enableSharding": initCollection.destDB}
+	initCollection.destClient.DB("admin").Run(command, &result)
+	command = bson.M{"shardCollection": initCollection.destDB + "." + initCollection.destColl, "key": initCollection.srcShardKey}
+	err := initCollection.destClient.DB("admin").Run(command, &result)
 	if err != nil {
-		logger.Fatal("shard dest collection fail,exit.")
+		logger.Panicln("shard dest collection fail,exit.")
 	}
 }
 
 // pre split and move chunks
-func (i *InitCollection) PreAllocChunks() {
+func (initCollection *InitCollection) PreAllocChunks() {
 	logger.Println("start pre split and move chunks")
 	rand.Seed(time.Now().UnixNano())
-	query := bson.M{"ns": i.srcDB + "." + i.srcColl}
+	query := bson.M{"ns": initCollection.srcDB + "." + initCollection.srcColl}
 	var command, result, chunk bson.M
 	var randomShard string
 	var chunkMin bson.M
 	var isChunkLegal bool
 	var err error
-	srcChunksIter := i.srcClient.DB("config").C("chunks").Find(query).Iter()
+	srcChunksIter := initCollection.srcClient.DB("config").C("chunks").Find(query).Iter()
 	for srcChunksIter.Next(&chunk) {
 		if chunkMin, isChunkLegal = chunk["min"].(bson.M); isChunkLegal {
-			command = bson.M{"split": i.destDB + "." + i.destColl, "middle": chunkMin}
-			err = i.destClient.DB("admin").Run(command, &result)
+			command = bson.M{"split": initCollection.destDB + "." + initCollection.destColl, "middle": chunkMin}
+			err = initCollection.destClient.DB("admin").Run(command, &result)
 			if err != nil {
 				logger.Println("split chunk fail,err is : ", err)
 			}
-			randomShard = i.GetRandomShard()
-			command = bson.M{"moveChunk": i.srcDB + "." + i.srcColl, "find": chunkMin, "to": randomShard}
-			err = i.destClient.DB("admin").Run(command, &result)
+			randomShard = initCollection.GetRandomShard()
+			command = bson.M{"moveChunk": initCollection.srcDB + "." + initCollection.srcColl, "find": chunkMin, "to": randomShard}
+			err = initCollection.destClient.DB("admin").Run(command, &result)
 			if err != nil {
 				logger.Println("move chunk to ", randomShard, " fail,err is : ", err)
 			}
 		}
-		i.srcChunks = append(i.srcChunks, bson.M{"min": chunk["min"], "max": chunk["max"]})
+		initCollection.srcChunks = append(initCollection.srcChunks, bson.M{"min": chunk["min"], "max": chunk["max"]})
 	}
 	logger.Println("pre split and move chunks finished.")
 }
 
-func (i *InitCollection) Run() {
+func (initCollection *InitCollection) Run() {
 	logger.Println("pre checking conn status.")
-	i.InitConn()
+	initCollection.InitConn()
 	logger.Println("setting migrate step.")
-	i.SetStepSign()
+	initCollection.SetStepSign()
 	if DoShardCollection {
-		i.ShardDestCollection()
-		i.PreAllocChunks()
+		initCollection.ShardDestCollection()
+		initCollection.PreAllocChunks()
 	}
 }
 
 type CopyData struct {
-	baseInitCollection *InitCollection
-	workerNum          int
-	queryKey           string
-	queryChunk         []bson.M
+	initCollection *InitCollection
+	workerNum      int
+	queryKey       string
+	queryChunk     []bson.M
 }
 
-func NewCopyData(i *InitCollection, findAndInsertWorkerNum int) *CopyData {
-	return &CopyData{workerNum: findAndInsertWorkerNum, baseInitCollection: i}
+func NewCopyData(initCollection *InitCollection, findAndInsertWorkerNum int) *CopyData {
+	return &CopyData{workerNum: findAndInsertWorkerNum, initCollection: initCollection}
 }
 
 // when doing find and insert , we use many goroutine , each goroutine copy one range of data,
 // we use the first key of shardkey as the query condition
-func (c *CopyData) GetQueryKey() {
-	if c.baseInitCollection.srcIsSharded {
+func (copyData *CopyData) GetQueryKey() {
+	if copyData.initCollection.srcIsSharded {
 		logger.Println("select the first key of shardkey as query condition.")
-		c.queryKey = c.baseInitCollection.srcShardKey[0].Name
+		copyData.queryKey = copyData.initCollection.srcShardKey[0].Name
 	} else {
-		c.queryKey = " "
+		copyData.queryKey = " "
 	}
-	logger.Println("query condition key is : ", c.queryKey)
+	logger.Println("query condition key is : ", copyData.queryKey)
 }
 
 // one goroutine,find and insert data
-func (c *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
-	srcMongoUri := GenMongoDBUri(c.baseInitCollection.src, c.baseInitCollection.srcUserName, c.baseInitCollection.srcPassWord)
-	destMongoUri := GenMongoDBUri(c.baseInitCollection.dest, c.baseInitCollection.destUserName, c.baseInitCollection.destPassWord)
+func (copyData *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
+	srcMongoUri := GenMongoDBUri(copyData.initCollection.src, copyData.initCollection.srcUserName, copyData.initCollection.srcPassWord)
+	destMongoUri := GenMongoDBUri(copyData.initCollection.dest, copyData.initCollection.destUserName, copyData.initCollection.destPassWord)
 	srcClient, _ := mgo.Dial(srcMongoUri)
 	destClient, _ := mgo.Dial(destMongoUri)
-	srcCollConn := srcClient.DB(c.baseInitCollection.srcDB).C(c.baseInitCollection.srcColl)
-	destCollConn := destClient.DB(c.baseInitCollection.destDB).C(c.baseInitCollection.destColl)
+	destClient.EnsureSafe(&mgo.Safe{W: copyData.initCollection.writeAck, WMode: copyData.initCollection.writeMode, FSync: copyData.initCollection.fsync, J: copyData.initCollection.journal})
+	srcCollConn := srcClient.DB(copyData.initCollection.srcDB).C(copyData.initCollection.srcColl)
+	destCollConn := destClient.DB(copyData.initCollection.destDB).C(copyData.initCollection.destColl)
 	var query bson.M
 	for {
 		chunkQueueLock.Lock() // as read from channel has no wait time or no wait get,we use one lock here,check whether the queue is empty
@@ -371,25 +377,25 @@ func (c *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
 }
 
 // make query queue,start copy goroutine
-func (c *CopyData) StartCopyData() {
-	chunkQueue := make(chan bson.M, len(c.queryChunk))
+func (copyData *CopyData) StartCopyData() {
+	chunkQueue := make(chan bson.M, len(copyData.queryChunk))
 	tmpChunkFilter := make(map[interface{}]bool) // in case copy same chunk(as _id is unique,will not cause error,but waste time)
-	for _, queryRange := range c.queryChunk {
-		query := bson.M{c.queryKey: bson.M{"$gte": queryRange["min"], "$lt": queryRange["max"]}}
+	for _, queryRange := range copyData.queryChunk {
+		query := bson.M{copyData.queryKey: bson.M{"$gte": queryRange["min"], "$lt": queryRange["max"]}}
 		if tmpChunkFilter[queryRange["min"]] == false {
 			chunkQueue <- query
 			tmpChunkFilter[queryRange["min"]] = true
 		}
 	}
 
-	chs := make([]chan int, c.workerNum)
+	chs := make([]chan int, copyData.workerNum)
 
-	for i := 0; i < c.workerNum; i++ {
+	for i := 0; i < copyData.workerNum; i++ {
 		chs[i] = make(chan int)
-		go c.RangeCopy(chunkQueue, chs[i])
+		go copyData.RangeCopy(chunkQueue, chs[i])
 	}
 	for {
-		logger.Println("chunk query queue has", len(c.queryChunk)-len(chunkQueue), "copying or copyed ,all chunk num is", len(c.queryChunk), "process is", (len(c.queryChunk)-len(chunkQueue))*100.0/len(c.queryChunk), "%")
+		logger.Println("chunk query queue has", len(copyData.queryChunk)-len(chunkQueue), "copying or copyed ,all chunk num is", len(copyData.queryChunk), "process is", (len(copyData.queryChunk)-len(chunkQueue))*100.0/len(copyData.queryChunk), "%")
 		if len(chunkQueue) != 0 {
 			time.Sleep(1e10)
 		} else {
@@ -403,37 +409,37 @@ func (c *CopyData) StartCopyData() {
 	for _, ch := range chs {
 		<-ch
 		finshGoRoutine++
-		logger.Println("copy goroutine finished", finshGoRoutine, ",all goroutine num is", c.workerNum, "process is", finshGoRoutine*100.0/c.workerNum, "%")
+		logger.Println("copy goroutine finished", finshGoRoutine, ",all goroutine num is", copyData.workerNum, "process is", finshGoRoutine*100.0/copyData.workerNum, "%")
 	}
 
 	logger.Println("copy data finished.")
 }
 
-func (c *CopyData) GetQueyRange() {
-	if c.baseInitCollection.srcIsSharded {
+func (copyData *CopyData) GetQueyRange() {
+	if copyData.initCollection.srcIsSharded {
 		logger.Println("use chunk shardkey range getting query range")
-		for _, chunk := range c.baseInitCollection.srcChunks {
+		for _, chunk := range copyData.initCollection.srcChunks {
 			if minChunk, isMinChunkLegal := chunk["min"].(bson.M); isMinChunkLegal {
 				if maxChunk, isMaxChunkLegal := chunk["max"].(bson.M); isMaxChunkLegal {
-					minQueryKey := minChunk[c.queryKey]
-					maxQueryKey := maxChunk[c.queryKey]
-					c.queryChunk = append(c.queryChunk, bson.M{"min": minQueryKey, "max": maxQueryKey})
+					minQueryKey := minChunk[copyData.queryKey]
+					maxQueryKey := maxChunk[copyData.queryKey]
+					copyData.queryChunk = append(copyData.queryChunk, bson.M{"min": minQueryKey, "max": maxQueryKey})
 				}
 			}
 		}
 	} else {
-		c.queryChunk = append(c.queryChunk, bson.M{})
+		copyData.queryChunk = append(copyData.queryChunk, bson.M{})
 	}
 	logger.Println("get query key range finished,multi conn copy data will be faster.")
 }
 
 // *bug:* text index create fail.
-func (c *CopyData) BuildIndexes() {
+func (copyData *CopyData) BuildIndexes() {
 	logger.Println("start build indexes")
-	indexes, _ := c.baseInitCollection.srcCollConn.Indexes()
+	indexes, _ := copyData.initCollection.srcCollConn.Indexes()
 	var err error
 	for _, index := range indexes {
-		err = c.baseInitCollection.destCollConn.EnsureIndex(index)
+		err = copyData.initCollection.destCollConn.EnsureIndex(index)
 		if err != nil {
 			logger.Println("build index Fail,please check it yourself.Fail index is : ", index)
 		} else {
@@ -444,13 +450,13 @@ func (c *CopyData) BuildIndexes() {
 }
 
 // find the smallest ts and save it(as oplog can be ran many times).
-func (c *CopyData) SaveLastOpTs() {
+func (copyData *CopyData) SaveLastOpTs() {
 	logger.Println("save last ts in oplog,use it when syncing oplog.")
-	chs := make([]chan bson.MongoTimestamp, len(c.baseInitCollection.srcOplogNodes))
+	chs := make([]chan bson.MongoTimestamp, len(copyData.initCollection.srcOplogNodes))
 	i := 0
-	for _, oplogNode := range c.baseInitCollection.srcOplogNodes {
+	for _, oplogNode := range copyData.initCollection.srcOplogNodes {
 		chs[i] = make(chan bson.MongoTimestamp)
-		go c.GetLastOpTs(chs[i], oplogNode)
+		go copyData.GetLastOpTs(chs[i], oplogNode)
 		i++
 	}
 
@@ -464,8 +470,8 @@ func (c *CopyData) SaveLastOpTs() {
 	logger.Println("saved last op is : ", LastOpTs)
 }
 
-func (c *CopyData) GetLastOpTs(ch chan bson.MongoTimestamp, node string) {
-	mongoUri := GenMongoDBUri(node, c.baseInitCollection.srcUserName, c.baseInitCollection.srcPassWord)
+func (copyData *CopyData) GetLastOpTs(ch chan bson.MongoTimestamp, node string) {
+	mongoUri := GenMongoDBUri(node, copyData.initCollection.srcUserName, copyData.initCollection.srcPassWord)
 	mongoClient, _ := mgo.Dial(mongoUri)
 	var result bson.M
 	mongoClient.DB("local").C("oplog.rs").Find(bson.M{}).Sort("$natural").Limit(1).One(&result)
@@ -476,70 +482,70 @@ func (c *CopyData) GetLastOpTs(ch chan bson.MongoTimestamp, node string) {
 	ch <- ts
 }
 
-func (c *CopyData) Run() {
-	c.BuildIndexes()
-	c.GetQueryKey()
-	c.GetQueyRange()
-	c.SaveLastOpTs()
-	c.StartCopyData()
+func (copyData *CopyData) Run() {
+	copyData.BuildIndexes()
+	copyData.GetQueryKey()
+	copyData.GetQueyRange()
+	copyData.SaveLastOpTs()
+	copyData.StartCopyData()
 }
 
-func (c *CopyData) LoadProgress() {
-
-}
-
-func (c *CopyData) DumpProgress() {
+func (copyData *CopyData) LoadProgress() {
 
 }
 
-func (c *CopyData) DumpFailDocuments() {
+func (copyData *CopyData) DumpProgress() {
+
+}
+
+func (copyData *CopyData) DumpFailDocuments() {
 
 }
 
 type OplogSync struct {
-	baseInitCollection *InitCollection
-	oplogSyncWorkerNum int
+	initCollection *InitCollection
 }
 
-func NewOplogSync(i *InitCollection, oplogSyncWorkerNum int) *OplogSync {
-	return &OplogSync{i, oplogSyncWorkerNum}
+func NewOplogSync(initCollection *InitCollection) *OplogSync {
+	return &OplogSync{initCollection}
 }
 
-func (o *OplogSync) ApplyOp(oplog bson.M) {
+func (oplogSync *OplogSync) ApplyOp(oplog bson.M) {
 	op := oplog["op"]
 	switch op {
 	case "i":
-		o.baseInitCollection.destCollConn.Insert(oplog["o"])
+		oplogSync.initCollection.destCollConn.Insert(oplog["o"])
 	case "u":
-		o.baseInitCollection.destCollConn.Update(oplog["o2"], oplog["o"])
+		oplogSync.initCollection.destCollConn.Update(oplog["o2"], oplog["o"])
 	case "d":
-		o.baseInitCollection.destCollConn.Remove(oplog["o"])
+		oplogSync.initCollection.destCollConn.Remove(oplog["o"])
 	}
 }
 
-func (o *OplogSync) StartOplogSync(node string) {
-	mongoUri := GenMongoDBUri(node, o.baseInitCollection.srcUserName, o.baseInitCollection.srcPassWord)
+func (oplogSync *OplogSync) StartOplogSync(node string) {
+	mongoUri := GenMongoDBUri(node, oplogSync.initCollection.srcUserName, oplogSync.initCollection.srcPassWord)
 	mongoClient, _ := mgo.Dial(mongoUri)
+	mongoClient.EnsureSafe(&mgo.Safe{W: oplogSync.initCollection.writeAck, WMode: oplogSync.initCollection.writeMode, FSync: oplogSync.initCollection.fsync, J: oplogSync.initCollection.journal})
 	var result bson.M
 
 	// dont use OPLOG_REPLAY here,just be careful
-	oplogIter := mongoClient.DB("local").C("oplog.rs").Find(bson.M{"ts": bson.M{"$gte": LastOpTs}, "ns": o.baseInitCollection.srcDB + "." + o.baseInitCollection.srcColl, "fromMigrate": bson.M{"$exists": false}}).Sort("$natural").Tail(-1)
+	oplogIter := mongoClient.DB("local").C("oplog.rs").Find(bson.M{"ts": bson.M{"$gte": LastOpTs}, "ns": oplogSync.initCollection.srcDB + "." + oplogSync.initCollection.srcColl, "fromMigrate": bson.M{"$exists": false}}).Sort("$natural").Tail(-1)
 	oplogSyncTs[node] = LastOpTs
 	for oplogIter.Next(&result) {
 		if ts, ok := result["ts"].(bson.MongoTimestamp); ok {
 			oplogSyncTs[node] = ts
 		}
-		o.ApplyOp(result)
+		oplogSync.ApplyOp(result)
 	}
 }
 
-func (o *OplogSync) Run() {
-	for _, oplogNode := range o.baseInitCollection.srcOplogNodes {
-		go o.StartOplogSync(oplogNode)
+func (oplogSync *OplogSync) Run() {
+	for _, oplogNode := range oplogSync.initCollection.srcOplogNodes {
+		go oplogSync.StartOplogSync(oplogNode)
 	}
 	for {
 		for node, ts := range oplogSyncTs {
-			mongoClient, _ := mgo.Dial(GenMongoDBUri(node, o.baseInitCollection.srcUserName, o.baseInitCollection.srcPassWord))
+			mongoClient, _ := mgo.Dial(GenMongoDBUri(node, oplogSync.initCollection.srcUserName, oplogSync.initCollection.srcPassWord))
 			var firstOplog bson.M
 			mongoClient.DB("local").C("oplog.rs").Find(bson.M{}).Sort("-$natural").Limit(1).One(&firstOplog)
 			if firstOplogTs, ok := firstOplog["ts"].(bson.MongoTimestamp); ok {
@@ -553,18 +559,21 @@ func (o *OplogSync) Run() {
 	}
 }
 
-func (o *OplogSync) LoadProgress() {
+func (oplogSync *OplogSync) LoadProgress() {
 
 }
 
-func (o *OplogSync) DumpProgress() {
+func (oplogSync *OplogSync) DumpProgress() {
 
 }
 
 func main() {
 	var src, dest, srcDB, srcColl, destDB, destColl, srcUserName, srcPassWord, destUserName, destPassWord string
-	var writeConcern, findAndInsertWorkerNum, oplogSyncWorkerNum int
-	var journaled bool
+	var findAndInsertWorkerNum int
+
+	var writeAck int
+	var writeMode string
+	var journal, fsync bool
 
 	flag.StringVar(&src, "src", "127.0.0.1:27017", "src , ip:port")
 	flag.StringVar(&dest, "dest", "127.0.0.1:27017", "dest , ip:port")
@@ -579,22 +588,33 @@ func main() {
 	flag.StringVar(&destUserName, "destUserName", "", "dest auth user name")
 	flag.StringVar(&destPassWord, "destPassWord", "", "dest auth password")
 
-	flag.IntVar(&writeConcern, "w", 1, "write acknowledged")
-	flag.BoolVar(&journaled, "j", true, "journaled")
+	flag.IntVar(&writeAck, "writeAck", 1, "write acknowledged")
+	flag.StringVar(&writeMode, "write Mode, e.g Majority", "", "write acknowledged")
+	flag.BoolVar(&journal, "journal", true, "whether use journal")
+	flag.BoolVar(&fsync, "fsync", false, "whether use fsync for each write")
 
 	flag.IntVar(&findAndInsertWorkerNum, "findAndInsertWorkerNum", 10, "find and insert worker num")
-	flag.IntVar(&oplogSyncWorkerNum, "oplogSyncWorkerNum", 10, "oplog sync worker num")
 
 	flag.Parse()
 
-	logFile, _ = os.OpenFile("log/ms.log", os.O_RDWR|os.O_CREATE, 0777)
-	logger = log.New(logFile, "\r\n", log.Ldate|log.Ltime|log.Lshortfile)
+	logFile, _ = os.OpenFile("log/ms.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	writers := []io.Writer{
+		logFile,
+		os.Stdout,
+	}
+	fileAndStdoutWriter := io.MultiWriter(writers...)
+	logger = log.New(fileAndStdoutWriter, "\r\n", log.Ldate|log.Ltime|log.Lshortfile)
 	connTimeOut = time.Duration(5) * time.Second
 	oplogSyncTs = make(map[string]bson.MongoTimestamp)
 
+	defer func() {
+		logger.Println("============================end this job=================================")
+		logFile.Close()
+	}()
+	logger.Println("===================================start one new job.==================================")
 	//init step
 	logger.Println("start init collection")
-	initCollection := NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord)
+	initCollection := NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync)
 	initCollection.Run()
 
 	//copy data step
@@ -606,7 +626,7 @@ func main() {
 	//oplog sync step
 
 	logger.Println("start sync oplog")
-	oplogSync := NewOplogSync(initCollection, oplogSyncWorkerNum)
+	oplogSync := NewOplogSync(initCollection)
 	oplogSync.Run()
 
 }
