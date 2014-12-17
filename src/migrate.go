@@ -521,7 +521,9 @@ func (copyData *CopyData) SaveLastOpTs() {
 		<-ts
 	}
 
-	logger.Println("saved last op ts is : ", oplogSyncTs)
+	for shardAndNode, ts := range oplogSyncTs {
+		logger.Println("saved last op ts for ", shardAndNode, " is : ", ts>>32)
+	}
 }
 
 func (copyData *CopyData) GetLastOpTs(ch chan int, shard string, node string) {
