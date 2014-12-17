@@ -26,46 +26,47 @@ func GenMongoDBUri(addr, userName, passWord string) string {
 
 var DoShardCollection bool // if true,do shard and pre split,movechunk in dest mongos
 var DoOplogSync bool       // if true,apply oplog during copy data
-var LastOpTs bson.MongoTimestamp
 var connTimeOut time.Duration
 
 var chunkQueueLock sync.Mutex // channel does not have timeout or getNoWait,use this lock,check whether empty first before get.
 
 var logFile *os.File
 var logger *log.Logger
-var oplogSyncTs map[string]bson.MongoTimestamp // while syncing oplog,each replset delay ts
+var oplogSyncTs map[string]bson.MongoTimestamp // while syncing oplog,each replset syncing ts
 
 type InitCollection struct {
-	src           string
-	dest          string
-	srcDB         string
-	srcColl       string
-	srcUserName   string
-	srcPassWord   string
-	destDB        string
-	destColl      string
-	destUserName  string
-	destPassWord  string
-	writeAck      int
-	writeMode     string
-	journal       bool
-	fsync         bool
-	srcClient     *mgo.Session
-	destClient    *mgo.Session
-	srcDBConn     *mgo.Database
-	srcCollConn   *mgo.Collection
-	destDBConn    *mgo.Database
-	destCollConn  *mgo.Collection
-	srcIsMongos   bool
-	srcIsSharded  bool
-	destIsMongos  bool
-	srcOplogNodes map[string]string
-	srcShardKey   bson.D
-	srcChunks     []bson.M
+	src                 string
+	dest                string
+	srcDB               string
+	srcColl             string
+	srcUserName         string
+	srcPassWord         string
+	destDB              string
+	destColl            string
+	destUserName        string
+	destPassWord        string
+	writeAck            int
+	writeMode           string
+	journal             bool
+	fsync               bool
+	srcClient           *mgo.Session
+	destClient          *mgo.Session
+	srcDBConn           *mgo.Database
+	srcCollConn         *mgo.Collection
+	destDBConn          *mgo.Database
+	destCollConn        *mgo.Collection
+	srcIsMongos         bool
+	srcIsSharded        bool
+	destIsMongos        bool
+	srcOplogNodes       map[string]string
+	srcShardKey         bson.D
+	srcChunks           []bson.M
+	srcBalancerStopped  bool
+	destBalancerStopped bool
 }
 
 func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string, writeAck int, writeMode string, fsync, journal bool) *InitCollection {
-	initCollection := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil}
+	initCollection := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil, false, false}
 	initCollection.srcOplogNodes = make(map[string]string)
 	return initCollection
 }
@@ -210,9 +211,17 @@ func (initCollection *InitCollection) SelectOplogSyncNode(nodes string) string {
 
 // if one replset available to src ns,do oplog sync
 func (initCollection *InitCollection) ShouldDoOplogSync() {
+	var query bson.M
+	var result bson.M
 	if initCollection.srcIsMongos {
-		query := bson.M{}
-		var result bson.M
+		if initCollection.srcIsSharded {
+			query = bson.M{}
+		} else {
+			initCollection.srcClient.DB("config").C("databases").Find(bson.M{"_id": initCollection.srcDB}).One(&result)
+			primaryShard := result["primary"]
+			query = bson.M{"_id": primaryShard}
+		}
+		logger.Println("src ns do oplogsync chenck for query", query)
 		shardsColl := initCollection.srcClient.DB("config").C("shards")
 		shards := shardsColl.Find(query).Iter()
 		var valueId, valueHost string
@@ -273,13 +282,13 @@ func (initCollection *InitCollection) SetStepSign() {
 // do shard on dest ns
 func (initCollection *InitCollection) ShardDestCollection() {
 	logger.Println("start sharding dest collection")
-	var result, command bson.M
-	command = bson.M{"enableSharding": initCollection.destDB}
+	var result, command bson.D
+	command = bson.D{{"enableSharding", initCollection.destDB}}
 	initCollection.destClient.DB("admin").Run(command, &result)
-	command = bson.M{"shardCollection": initCollection.destDB + "." + initCollection.destColl, "key": initCollection.srcShardKey}
+	command = bson.D{{"shardCollection", initCollection.destDB + "." + initCollection.destColl}, {"key", initCollection.srcShardKey}}
 	err := initCollection.destClient.DB("admin").Run(command, &result)
 	if err != nil {
-		logger.Panicln("shard dest collection fail,exit.")
+		logger.Panicln("shard dest collection fail:", err)
 	}
 }
 
@@ -288,7 +297,8 @@ func (initCollection *InitCollection) PreAllocChunks() {
 	logger.Println("start pre split and move chunks")
 	rand.Seed(time.Now().UnixNano())
 	query := bson.M{"ns": initCollection.srcDB + "." + initCollection.srcColl}
-	var command, result, chunk bson.M
+	var result, chunk bson.M
+	var command bson.D
 	var randomShard string
 	var chunkMin bson.M
 	var isChunkLegal bool
@@ -296,16 +306,20 @@ func (initCollection *InitCollection) PreAllocChunks() {
 	srcChunksIter := initCollection.srcClient.DB("config").C("chunks").Find(query).Iter()
 	for srcChunksIter.Next(&chunk) {
 		if chunkMin, isChunkLegal = chunk["min"].(bson.M); isChunkLegal {
-			command = bson.M{"split": initCollection.destDB + "." + initCollection.destColl, "middle": chunkMin}
+			command = bson.D{{"split", initCollection.destDB + "." + initCollection.destColl}, {"middle", chunkMin}}
 			err = initCollection.destClient.DB("admin").Run(command, &result)
 			if err != nil {
 				logger.Println("split chunk fail,err is : ", err)
+			} else {
+				logger.Println("split chunk success")
 			}
 			randomShard = initCollection.GetRandomShard()
-			command = bson.M{"moveChunk": initCollection.srcDB + "." + initCollection.srcColl, "find": chunkMin, "to": randomShard}
+			command = bson.D{{"moveChunk", initCollection.srcDB + "." + initCollection.srcColl}, {"find", chunkMin}, {"to", randomShard}}
 			err = initCollection.destClient.DB("admin").Run(command, &result)
 			if err != nil {
 				logger.Println("move chunk to ", randomShard, " fail,err is : ", err)
+			} else {
+				logger.Println("move chunk to ", randomShard, "success")
 			}
 		}
 		initCollection.srcChunks = append(initCollection.srcChunks, bson.M{"min": chunk["min"], "max": chunk["max"]})
@@ -313,11 +327,53 @@ func (initCollection *InitCollection) PreAllocChunks() {
 	logger.Println("pre split and move chunks finished.")
 }
 
+func (initCollection *InitCollection) StopBalancer() {
+	query := bson.M{"_id": "balancer"}
+	updateDocument := bson.M{"$set": bson.M{"stopped": true}}
+	var result bson.M
+	if initCollection.srcIsMongos {
+		initCollection.srcClient.DB("config").C("settings").Find(query).One(&result)
+		if srcBalancerStopped, srcBalancerStateChanged := result["stopped"].(bool); srcBalancerStateChanged {
+			initCollection.srcBalancerStopped = srcBalancerStopped
+		} else {
+			initCollection.srcBalancerStopped = false
+		}
+
+	}
+	if initCollection.destIsMongos {
+		initCollection.destClient.DB("config").C("settings").Find(query).One(&result)
+		if destBalancerStopped, destBalancerStateChanged := result["stopped"].(bool); destBalancerStateChanged {
+			initCollection.destBalancerStopped = destBalancerStopped
+		} else {
+			initCollection.destBalancerStopped = false
+		}
+	}
+	logger.Println("stop src balancer ... ")
+	initCollection.destClient.DB("config").C("settings").Update(query, updateDocument)
+
+	logger.Println("stop dest balancer...")
+	initCollection.srcClient.DB("config").C("settings").Update(query, updateDocument)
+
+	logger.Println("src origin balancer is stopped:", initCollection.srcBalancerStopped)
+	logger.Println("dest origin balancer is stopped:", initCollection.destBalancerStopped)
+}
+
+func (initCollection *InitCollection) ResetBalancer() {
+	query := bson.M{"_id": "balancer"}
+	if initCollection.srcIsMongos {
+		initCollection.srcClient.DB("config").C("settings").Update(query, bson.M{"stopped": initCollection.srcBalancerStopped})
+	}
+	if initCollection.destIsMongos {
+		initCollection.destClient.DB("config").C("settings").Update(query, bson.M{"stopped": initCollection.destBalancerStopped})
+	}
+}
+
 func (initCollection *InitCollection) Run() {
 	logger.Println("pre checking conn status.")
 	initCollection.InitConn()
 	logger.Println("setting migrate step.")
 	initCollection.SetStepSign()
+	initCollection.StopBalancer()
 	if DoShardCollection {
 		initCollection.ShardDestCollection()
 		initCollection.PreAllocChunks()
@@ -452,34 +508,30 @@ func (copyData *CopyData) BuildIndexes() {
 // find the smallest ts and save it(as oplog can be ran many times).
 func (copyData *CopyData) SaveLastOpTs() {
 	logger.Println("save last ts in oplog,use it when syncing oplog.")
-	chs := make([]chan bson.MongoTimestamp, len(copyData.initCollection.srcOplogNodes))
+	chs := make([]chan int, len(copyData.initCollection.srcOplogNodes))
 	i := 0
-	for _, oplogNode := range copyData.initCollection.srcOplogNodes {
-		chs[i] = make(chan bson.MongoTimestamp)
-		go copyData.GetLastOpTs(chs[i], oplogNode)
+	for shard, oplogNode := range copyData.initCollection.srcOplogNodes {
+		chs[i] = make(chan int)
+		go copyData.GetLastOpTs(chs[i], shard, oplogNode)
 		i++
 	}
 
 	for _, ts := range chs {
-		tmpTs := <-ts
-		if LastOpTs == 0 || tmpTs < LastOpTs {
-			LastOpTs = tmpTs
-		}
+		<-ts
 	}
 
-	logger.Println("saved last op is : ", LastOpTs)
+	logger.Println("saved last op ts is : ", oplogSyncTs)
 }
 
-func (copyData *CopyData) GetLastOpTs(ch chan bson.MongoTimestamp, node string) {
+func (copyData *CopyData) GetLastOpTs(ch chan int, shard string, node string) {
 	mongoUri := GenMongoDBUri(node, copyData.initCollection.srcUserName, copyData.initCollection.srcPassWord)
 	mongoClient, _ := mgo.Dial(mongoUri)
 	var result bson.M
-	mongoClient.DB("local").C("oplog.rs").Find(bson.M{}).Sort("$natural").Limit(1).One(&result)
-	var ts bson.MongoTimestamp
+	mongoClient.DB("local").C("oplog.rs").Find(bson.M{}).Sort("-$natural").Limit(1).One(&result)
 	if lastOpTs, ok := result["ts"].(bson.MongoTimestamp); ok {
-		ts = lastOpTs
+		oplogSyncTs[shard+"/"+node] = lastOpTs
 	}
-	ch <- ts
+	ch <- 1
 }
 
 func (copyData *CopyData) Run() {
@@ -522,40 +574,59 @@ func (oplogSync *OplogSync) ApplyOp(oplog bson.M) {
 	}
 }
 
-func (oplogSync *OplogSync) StartOplogSync(node string) {
+func (oplogSync *OplogSync) StartOplogSync(shard string, node string) {
 	mongoUri := GenMongoDBUri(node, oplogSync.initCollection.srcUserName, oplogSync.initCollection.srcPassWord)
 	mongoClient, _ := mgo.Dial(mongoUri)
 	mongoClient.EnsureSafe(&mgo.Safe{W: oplogSync.initCollection.writeAck, WMode: oplogSync.initCollection.writeMode, FSync: oplogSync.initCollection.fsync, J: oplogSync.initCollection.journal})
 	var result bson.M
 
-	// dont use OPLOG_REPLAY here,just be careful
-	oplogIter := mongoClient.DB("local").C("oplog.rs").Find(bson.M{"ts": bson.M{"$gte": LastOpTs}, "ns": oplogSync.initCollection.srcDB + "." + oplogSync.initCollection.srcColl, "fromMigrate": bson.M{"$exists": false}}).Sort("$natural").Tail(-1)
-	oplogSyncTs[node] = LastOpTs
+	// ok to use OPLOG_REPLAY here now
+	startLastOpTs := oplogSyncTs[shard+"/"+node]
+	oplogIter := mongoClient.DB("local").C("oplog.rs").Find(bson.M{"ts": bson.M{"$gte": startLastOpTs}}).LogReplay().Sort("$natural").Tail(-1)
 	for oplogIter.Next(&result) {
 		if ts, ok := result["ts"].(bson.MongoTimestamp); ok {
-			oplogSyncTs[node] = ts
+			oplogSyncTs[shard+"/"+node] = ts
 		}
+
+		if result["fromMigrate"] == true {
+			continue
+		}
+
+		if result["ns"] != oplogSync.initCollection.srcDB+"."+oplogSync.initCollection.srcColl {
+			continue
+		}
+
 		oplogSync.ApplyOp(result)
 	}
 }
 
 func (oplogSync *OplogSync) Run() {
-	for _, oplogNode := range oplogSync.initCollection.srcOplogNodes {
-		go oplogSync.StartOplogSync(oplogNode)
+	isResetBalancer := false
+	for shard, oplogNode := range oplogSync.initCollection.srcOplogNodes {
+		go oplogSync.StartOplogSync(shard, oplogNode)
 	}
 	for {
-		for node, ts := range oplogSyncTs {
+		shouldResetBalancer := true
+		for shardAndNode, ts := range oplogSyncTs {
+			node := strings.Split(shardAndNode, "/")[1]
 			mongoClient, _ := mgo.Dial(GenMongoDBUri(node, oplogSync.initCollection.srcUserName, oplogSync.initCollection.srcPassWord))
 			var firstOplog bson.M
 			mongoClient.DB("local").C("oplog.rs").Find(bson.M{}).Sort("-$natural").Limit(1).One(&firstOplog)
 			if firstOplogTs, ok := firstOplog["ts"].(bson.MongoTimestamp); ok {
-				delay := firstOplogTs - ts
-				logger.Println("node :", node, "delay is :", delay)
+				delay := firstOplogTs>>32 - ts>>32
+				logger.Print("node :", shardAndNode, " delay is :", delay)
+				if delay > 100 {
+					shouldResetBalancer = false
+				}
 			}
 			mongoClient.Close()
-
 		}
-		time.Sleep(1e9)
+		if shouldResetBalancer && !isResetBalancer {
+			logger.Println("oplog sync almost finished,reset balancer state...")
+			oplogSync.initCollection.ResetBalancer()
+			isResetBalancer = true
+		}
+		time.Sleep(5e9)
 	}
 }
 
