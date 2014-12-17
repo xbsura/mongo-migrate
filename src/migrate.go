@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -638,6 +639,16 @@ func (oplogSync *OplogSync) DumpProgress() {
 
 }
 
+func cleanJob() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	for sig := range c {
+		logger.Println("got ctrl-c,exit ing ...", sig)
+		logger.Println("===================================end this job.==================================")
+		os.Exit(0)
+	}
+}
+
 func main() {
 	var src, dest, srcDB, srcColl, destDB, destColl, srcUserName, srcPassWord, destUserName, destPassWord string
 	var findAndInsertWorkerNum int
@@ -678,10 +689,8 @@ func main() {
 	connTimeOut = time.Duration(5) * time.Second
 	oplogSyncTs = make(map[string]bson.MongoTimestamp)
 
-	defer func() {
-		logger.Println("============================end this job=================================")
-		logFile.Close()
-	}()
+	go cleanJob()
+
 	logger.Println("===================================start one new job.==================================")
 	//init step
 	logger.Println("start init collection")
