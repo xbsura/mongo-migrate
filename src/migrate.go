@@ -151,7 +151,7 @@ func (initColl *InitCollection) ShouldDoShardCollection() {
 
 // select a node which has no slaveDelay and better to be secondary if possible
 func (initColl *InitCollection) SelectOplogSyncNode(nodes string) string {
-	var selectNode string
+	var selectHost string
 	var hosts string
 	if strings.Contains(nodes, "/") {
 		hosts = strings.Split(nodes, "/")[1]
@@ -173,40 +173,52 @@ func (initColl *InitCollection) SelectOplogSyncNode(nodes string) string {
 	var replConf, replStatus bson.M
 	command := bson.M{"replSetGetStatus": 1}
 
+	replConfMap := make(map[interface{}]bson.M)
+	replStatusMap := make(map[interface{}]interface{})
+
 	mongoClient.DB("local").C("system.replset").Find(bson.M{}).One(&replConf)
 	mongoClient.DB("admin").Run(command, &replStatus)
 
-	var isHostLegal bool
-
-	if statusMembers, isStatusMembersLegal := replStatus["members"].([]interface{}); isStatusMembersLegal {
-	selectNode:
-		for _, statusMember := range statusMembers {
-			if bsonStatusMember, isBsonStatusMember := statusMember.(bson.M); isBsonStatusMember {
-				if bsonStatusMember["state"] == 1 || bsonStatusMember["state"] == 2 {
-					if confMembers, isConfMembersLegal := replConf["members"].([]interface{}); isConfMembersLegal {
-						for _, confMember := range confMembers {
-							if bsonConfMember, isBsonConfMember := confMember.(bson.M); isBsonConfMember {
-								if bsonConfMember["_id"] == bsonStatusMember["_id"] {
-									if bsonConfMember["slaveDelay"] == 0 {
-										if selectNode, isHostLegal = bsonConfMember["host"].(string); isHostLegal {
-											selectNode = selectNode
-										}
-										if bsonStatusMember["state"] == 2 {
-											break selectNode
-										}
-									}
-								}
-							}
-						}
-					}
-				}
+	if confMembers, isConfMembersLegal := replConf["members"].([]interface{}); isConfMembersLegal {
+		for _, confMember := range confMembers {
+			if bsonConfMember, isBsonConfMember := confMember.(bson.M); isBsonConfMember {
+				hostAndDelay := bson.M{"host": bsonConfMember["host"], "slaveDelay": bsonConfMember["slaveDelay"]}
+				replConfMap[bsonConfMember["_id"]] = hostAndDelay
 			}
 		}
 	}
 
+	if statusMembers, isStatusMembersLegal := replStatus["members"].([]interface{}); isStatusMembersLegal {
+		for _, statusMember := range statusMembers {
+			if bsonStatusMember, isBsonStatusMember := statusMember.(bson.M); isBsonStatusMember {
+				replStatusMap[bsonStatusMember["_id"]] = bsonStatusMember["state"]
+			}
+		}
+	}
+
+	logger.Println("replStatus:", replStatusMap)
+
+	logger.Println("replConf:", replConfMap)
+
+	for id, state := range replStatusMap {
+		if state == 1 || state == 2 {
+			if replConfMap[id]["slaveDelay"] == 0 {
+				if host, ok := replConfMap[id]["host"].(string); ok {
+					logger.Println("one node selected")
+					selectHost = host
+				}
+			}
+			if state == 2 {
+				break
+			}
+		}
+	}
+
+	logger.Println("oplog sync node selected:", selectHost)
+
 	mongoClient.Close()
 
-	return selectNode
+	return selectHost
 
 }
 
