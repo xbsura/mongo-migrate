@@ -9,6 +9,8 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -64,14 +66,98 @@ type InitCollection struct {
 	srcChunks           []bson.M
 	srcBalancerStopped  bool
 	destBalancerStopped bool
+	minKey              string
+	maxKey              string
+	keyType             string
+	queryKey            string
+	withOutKeyType      string
+	skipPreAlloc        bool
 }
 
-func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string, writeAck int, writeMode string, fsync, journal bool) *InitCollection {
-	initColl := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil, false, false}
+func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string, writeAck int, writeMode string, fsync, journal bool, minKey, maxKey, keyType, withOutKeyType string) *InitCollection {
+	initColl := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil, false, false, minKey, maxKey, keyType, "", withOutKeyType, false}
 	initColl.srcOplogNodes = make(map[string]string)
 	return initColl
 }
+func (initColl *InitCollection) documentLegal(result bson.M, resType string) bool {
+	var isValueString, isValueFloat64 bool
+	var valueString string
+	var valueFloat64 float64
 
+	oResult := result
+
+	if resType == "oplog" {
+		oResult, _ = result["o"].(bson.M)
+	}
+
+	if initColl.withOutKeyType != "" {
+		queryKeyValue, isQueryKeyExist := oResult[initColl.queryKey]
+		if !isQueryKeyExist {
+			return true
+		} else {
+			queryKeyValueType := reflect.TypeOf(queryKeyValue).String()
+			if queryKeyValueType == "int64" || queryKeyValueType == "float64" {
+				queryKeyValueType = "int"
+			}
+			if strings.Contains(initColl.withOutKeyType, queryKeyValueType) {
+				return false
+			}
+
+		}
+	}
+
+	valueString, isValueString = oResult[initColl.queryKey].(string)
+	if valueInt64, isValueInt64 := oResult[initColl.queryKey].(int64); isValueInt64 {
+		valueFloat64 = float64(valueInt64)
+		isValueFloat64 = true
+	}
+	if !isValueFloat64 {
+		valueFloat64, isValueFloat64 = oResult[initColl.queryKey].(float64)
+	}
+
+	if initColl.keyType == "string" {
+
+		if !isValueString {
+			return false
+		}
+
+		if initColl.minKey != "" {
+			if valueString < initColl.minKey {
+				return false
+			}
+		}
+
+		if initColl.maxKey != "" {
+			if valueString >= initColl.maxKey {
+				return false
+			}
+		}
+
+	}
+
+	if initColl.keyType == "int" {
+		if !isValueFloat64 {
+			return false
+		}
+
+		if initColl.minKey != "" {
+			intMinKey, _ := strconv.Atoi(initColl.minKey)
+			if valueFloat64 < float64(intMinKey) {
+				return false
+			}
+		}
+
+		if initColl.maxKey != "" {
+			intMaxKey, _ := strconv.Atoi(initColl.maxKey)
+			if valueFloat64 >= float64(intMaxKey) {
+				return false
+			}
+		}
+
+	}
+
+	return true
+}
 func (initColl *InitCollection) InitConn() {
 	srcMongoUri := GenMongoDBUri(initColl.src, initColl.srcUserName, initColl.srcPassWord)
 	destMongoUri := GenMongoDBUri(initColl.dest, initColl.destUserName, initColl.destPassWord)
@@ -204,7 +290,6 @@ func (initColl *InitCollection) SelectOplogSyncNode(nodes string) string {
 		if state == 1 || state == 2 {
 			if replConfMap[id]["slaveDelay"] == 0 {
 				if host, ok := replConfMap[id]["host"].(string); ok {
-					logger.Println("one node selected")
 					selectHost = host
 				}
 			}
@@ -303,7 +388,12 @@ func (initColl *InitCollection) ShardDestCollection() {
 	command = bson.D{{"shardCollection", destNs}, {"key", initColl.srcShardKey}}
 	err := initColl.destClient.DB("admin").Run(command, &result)
 	if err != nil {
-		logger.Panicln("shard dest collection fail:", err)
+		if strings.Contains(err.Error(), "already") {
+			logger.Println("dest ns already sharded,skip pre alloc...")
+			initColl.skipPreAlloc = true
+		} else {
+			logger.Panicln("shard dest collection fail:", err)
+		}
 	}
 }
 
@@ -311,7 +401,6 @@ func (initColl *InitCollection) ShardDestCollection() {
 func (initColl *InitCollection) PreAllocChunks() {
 	logger.Println("start pre split and move chunks")
 	rand.Seed(time.Now().UnixNano())
-	query := bson.M{"ns": initColl.srcDB + "." + initColl.srcColl}
 	var result, chunk bson.M
 	var command bson.D
 	var randomShard string
@@ -319,28 +408,49 @@ func (initColl *InitCollection) PreAllocChunks() {
 	var isChunkLegal bool
 	var err error
 	destNs := initColl.destDB + "." + initColl.destColl
-	srcChunksIter := initColl.srcClient.DB("config").C("chunks").Find(query).Iter()
-	for srcChunksIter.Next(&chunk) {
-		if chunkMin, isChunkLegal = chunk["min"].(bson.M); isChunkLegal {
-			command = bson.D{{"split", destNs}, {"middle", chunkMin}}
-			err = initColl.destClient.DB("admin").Run(command, &result)
-			if err != nil {
-				logger.Println("split chunk fail,err is : ", err)
-			} else {
-				logger.Println("split chunk success")
+	srcNs := initColl.srcDB + "." + initColl.srcColl
+	query := bson.M{"ns": srcNs}
+	logger.Println("chunks query:", query)
+	chunksColl := initColl.srcClient.DB("config").C("chunks")
+	srcChunksIter := chunksColl.Find(query).Iter()
+	var chunkSimple bson.M
+	if initColl.withOutKeyType == "" {
+		for srcChunksIter.Next(&chunk) {
+			if !initColl.chunkRangeOk(chunk) {
+				continue
 			}
-			randomShard = initColl.GetRandomShard()
-			command = bson.D{{"moveChunk", destNs}, {"find", chunkMin}, {"to", randomShard}}
-			err = initColl.destClient.DB("admin").Run(command, &result)
-			if err != nil {
-				logger.Println("move chunk to ", randomShard, " fail,err is : ", err)
-			} else {
-				logger.Println("move chunk to ", randomShard, "success")
+			if chunkMin, isChunkLegal = chunk["min"].(bson.M); isChunkLegal {
+				if !initColl.skipPreAlloc {
+					command = bson.D{{"split", destNs}, {"middle", chunkMin}}
+					err = initColl.destClient.DB("admin").Run(command, &result)
+					if err != nil {
+						logger.Println("split chunk fail,err is : ", err)
+					} else {
+						logger.Println("split chunk success")
+					}
+					randomShard = initColl.GetRandomShard()
+					command = bson.D{{"moveChunk", destNs}, {"find", chunkMin}, {"to", randomShard}}
+					err = initColl.destClient.DB("admin").Run(command, &result)
+					if err != nil {
+						logger.Println("move chunk to ", randomShard, " fail,err is : ", err)
+					} else {
+						logger.Println("move chunk to ", randomShard, "success")
+					}
+				} else {
+					logger.Println("dest ns sharded,skip pre alloc...")
+				}
 			}
+			chunkSimple = bson.M{"min": chunk["min"], "max": chunk["max"]}
+			initColl.srcChunks = append(initColl.srcChunks, chunkSimple)
 		}
-		initColl.srcChunks = append(initColl.srcChunks, bson.M{"min": chunk["min"], "max": chunk["max"]})
+		logger.Println("pre split and move chunks finished.")
+	} else {
+		var srcChunksSingle []bson.M
+		chunkSimple = bson.M{}
+		srcChunksSingle = append(srcChunksSingle, chunkSimple)
+		logger.Println("srcChunksSingle:", srcChunksSingle)
+		initColl.srcChunks = srcChunksSingle
 	}
-	logger.Println("pre split and move chunks finished.")
 }
 
 func (initColl *InitCollection) StopBalancer() {
@@ -386,6 +496,19 @@ func (initColl *InitCollection) ResetBalancer() {
 		initColl.destClient.DB("config").C("settings").Update(query, destBalancerDocument)
 	}
 }
+func (initColl *InitCollection) GetQueryKey() {
+	if initColl.srcIsSharded {
+		logger.Println("select the first key of shardkey as query condition.")
+		initColl.queryKey = initColl.srcShardKey[0].Name
+	} else {
+		initColl.queryKey = ""
+	}
+	logger.Println("query condition key is : ", initColl.queryKey)
+}
+
+func (initColl *InitCollection) chunkRangeOk(chunk bson.M) bool {
+	return true
+}
 
 func (initColl *InitCollection) Run() {
 	logger.Println("pre checking conn status.")
@@ -393,16 +516,14 @@ func (initColl *InitCollection) Run() {
 	logger.Println("setting migrate step.")
 	initColl.SetStepSign()
 	initColl.StopBalancer()
-	if DoShardCollection {
-		initColl.ShardDestCollection()
-		initColl.PreAllocChunks()
-	}
+	initColl.ShardDestCollection()
+	initColl.GetQueryKey()
+	initColl.PreAllocChunks()
 }
 
 type CopyData struct {
 	initColl   *InitCollection
 	workerNum  int
-	queryKey   string
 	queryChunk []bson.M
 }
 
@@ -412,15 +533,6 @@ func NewCopyData(initColl *InitCollection, findAndInsertWorkerNum int) *CopyData
 
 // when doing find and insert , we use many goroutine , each goroutine copy one range of data,
 // we use the first key of shardkey as the query condition
-func (copyData *CopyData) GetQueryKey() {
-	if copyData.initColl.srcIsSharded {
-		logger.Println("select the first key of shardkey as query condition.")
-		copyData.queryKey = copyData.initColl.srcShardKey[0].Name
-	} else {
-		copyData.queryKey = " "
-	}
-	logger.Println("query condition key is : ", copyData.queryKey)
-}
 
 // one goroutine,find and insert data
 func (copyData *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
@@ -441,9 +553,14 @@ func (copyData *CopyData) RangeCopy(chunkQueue chan bson.M, ch chan int) {
 			query = <-chunkQueue
 			chunkQueueLock.Unlock()
 		}
+		logger.Println("copy data query:", query)
 		documentsIter := srcCollConn.Find(query).Iter()
 		var document bson.M
+
 		for documentsIter.Next(&document) {
+			if !copyData.initColl.documentLegal(document, "document") {
+				continue
+			}
 			destCollConn.Insert(document)
 		}
 
@@ -456,7 +573,13 @@ func (copyData *CopyData) StartCopyData() {
 	chunkQueue := make(chan bson.M, len(copyData.queryChunk))
 	tmpChunkFilter := make(map[interface{}]bool) // in case copy same chunk(as _id is unique,will not cause error,but waste time)
 	for _, queryRange := range copyData.queryChunk {
-		query := bson.M{copyData.queryKey: bson.M{"$gte": queryRange["min"], "$lt": queryRange["max"]}}
+		var query bson.M
+		if copyData.initColl.withOutKeyType == "" {
+			query = bson.M{copyData.initColl.queryKey: bson.M{"$gte": queryRange["min"], "$lt": queryRange["max"]}}
+		} else {
+			query = bson.M{}
+		}
+		logger.Println("chunk query:", query)
 		if tmpChunkFilter[queryRange["min"]] == false {
 			chunkQueue <- query
 			tmpChunkFilter[queryRange["min"]] = true
@@ -491,13 +614,13 @@ func (copyData *CopyData) StartCopyData() {
 }
 
 func (copyData *CopyData) GetQueyRange() {
-	if copyData.initColl.srcIsSharded {
-		logger.Println("use chunk shardkey range getting query range")
+	if copyData.initColl.srcIsSharded && copyData.initColl.withOutKeyType == "" {
+		logger.Println("src chunks:", copyData.initColl.srcChunks)
 		for _, chunk := range copyData.initColl.srcChunks {
 			if minChunk, isMinChunkLegal := chunk["min"].(bson.M); isMinChunkLegal {
 				if maxChunk, isMaxChunkLegal := chunk["max"].(bson.M); isMaxChunkLegal {
-					minQueryKey := minChunk[copyData.queryKey]
-					maxQueryKey := maxChunk[copyData.queryKey]
+					minQueryKey := minChunk[copyData.initColl.queryKey]
+					maxQueryKey := maxChunk[copyData.initColl.queryKey]
 					copyData.queryChunk = append(copyData.queryChunk, bson.M{"min": minQueryKey, "max": maxQueryKey})
 				}
 			}
@@ -557,7 +680,6 @@ func (copyData *CopyData) GetLastOpTs(ch chan int, shard string, node string) {
 
 func (copyData *CopyData) Run() {
 	copyData.BuildIndexes()
-	copyData.GetQueryKey()
 	copyData.GetQueyRange()
 	copyData.SaveLastOpTs()
 	copyData.StartCopyData()
@@ -617,6 +739,10 @@ func (oplogSync *OplogSync) StartOplogSync(shard string, node string) {
 		}
 
 		if result["ns"] != srcNs {
+			continue
+		}
+
+		if !oplogSync.initColl.documentLegal(result, "oplog") {
 			continue
 		}
 
@@ -701,6 +827,16 @@ func main() {
 
 	flag.IntVar(&findAndInsertWorkerNum, "findAndInsertWorkerNum", 10, "find and insert worker num")
 
+	var argsMinKey, argsMaxKey, keyType string
+
+	flag.StringVar(&argsMinKey, "minKey", "", "min query key")
+	flag.StringVar(&argsMaxKey, "maxKey", "", "max query key")
+	flag.StringVar(&keyType, "keyType", "", "min and max query key type")
+
+	var withOutKeyType string
+
+	flag.StringVar(&withOutKeyType, "withOutKeyType", "", "range copy other data,copy other key type data")
+
 	flag.Parse()
 
 	logFile, _ = os.OpenFile("log/ms.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -718,7 +854,7 @@ func main() {
 	logger.Println("===================================start one new job.==================================")
 	//init step
 	logger.Println("start init collection")
-	initColl := NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync)
+	initColl := NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, argsMinKey, argsMaxKey, keyType, withOutKeyType)
 	initColl.Run()
 
 	//copy data step
