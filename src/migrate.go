@@ -72,10 +72,12 @@ type InitCollection struct {
 	queryKey            string
 	withOutKeyType      string
 	skipPreAlloc        bool
+    isTokumx            bool
+    destShards          []string
 }
 
-func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string, writeAck int, writeMode string, fsync, journal bool, minKey, maxKey, keyType, withOutKeyType string) *InitCollection {
-	initColl := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil, false, false, minKey, maxKey, keyType, "", withOutKeyType, false}
+func NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord string, writeAck int, writeMode string, fsync, journal bool, minKey, maxKey, keyType, withOutKeyType string,isTokumx bool) *InitCollection {
+	initColl := &InitCollection{src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, nil, nil, nil, nil, nil, nil, false, false, false, nil, nil, nil, false, false, minKey, maxKey, keyType, "", withOutKeyType, false,isTokumx,nil}
 	initColl.srcOplogNodes = make(map[string]string)
 	return initColl
 }
@@ -199,6 +201,16 @@ func (initColl *InitCollection) GetSrcDestType() {
 	if result["msg"] == "isdbgrid" {
 		initColl.destIsMongos = true
 		logger.Println("dest is mongos")
+		destShardsIter := initColl.destClient.DB("config").C("shards").Find(bson.M{}).Iter()
+        for destShardsIter.Next(&result) {
+            if destShardId,ok := result["_id"].(string);ok {
+                initColl.destShards = append(initColl.destShards,destShardId)
+            }
+        }
+
+        logger.Println("dest shards:",initColl.destShards)
+
+
 	} else {
 		logger.Println("dest is not mongos,may be mongod.")
 	}
@@ -358,18 +370,10 @@ func (initColl *InitCollection) ShouldDoOplogSync() {
 // when moveing chunk,select a random shard name
 func (initColl *InitCollection) GetRandomShard() string {
 	var randomShardId string
-	srcShardsNum := len(initColl.srcOplogNodes)
-	randomNum := rand.Intn(srcShardsNum)
-	k := 0
-	for shardId, _ := range initColl.srcOplogNodes {
-		if randomNum == k {
-			randomShardId = shardId
-			break
-		}
-		k++
-	}
-
-	return randomShardId
+	destShardsNum := len(initColl.destShards)
+	randomNum := rand.Intn(destShardsNum)
+	randomShardId = initColl.destShards[randomNum]
+    return randomShardId
 }
 
 func (initColl *InitCollection) SetStepSign() {
@@ -424,6 +428,7 @@ func (initColl *InitCollection) PreAllocChunks() {
 					command = bson.D{{"split", destNs}, {"middle", chunkMin}}
 					err = initColl.destClient.DB("admin").Run(command, &result)
 					if err != nil {
+                        logger.Println("command is:",command)
 						logger.Println("split chunk fail,err is : ", err)
 					} else {
 						logger.Println("split chunk success")
@@ -681,7 +686,9 @@ func (copyData *CopyData) GetLastOpTs(ch chan int, shard string, node string) {
 func (copyData *CopyData) Run() {
 	copyData.BuildIndexes()
 	copyData.GetQueyRange()
-	copyData.SaveLastOpTs()
+    if !copyData.initColl.isTokumx {
+	    copyData.SaveLastOpTs()
+    }
 	copyData.StartCopyData()
 }
 
@@ -837,6 +844,9 @@ func main() {
 
 	flag.StringVar(&withOutKeyType, "withOutKeyType", "", "range copy other data,copy other key type data")
 
+    var isTokumx bool
+    flag.BoolVar(&isTokumx, "isTokumx", false, "if src is tokumx,skip oplog replay.")
+
 	flag.Parse()
 
 	logFile, _ = os.OpenFile("log/ms.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
@@ -854,7 +864,7 @@ func main() {
 	logger.Println("===================================start one new job.==================================")
 	//init step
 	logger.Println("start init collection")
-	initColl := NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, argsMinKey, argsMaxKey, keyType, withOutKeyType)
+	initColl := NewInitCollection(src, dest, srcDB, srcColl, srcUserName, srcPassWord, destDB, destColl, destUserName, destPassWord, writeAck, writeMode, journal, fsync, argsMinKey, argsMaxKey, keyType, withOutKeyType,isTokumx)
 	initColl.Run()
 
 	//copy data step
@@ -865,8 +875,12 @@ func main() {
 
 	//oplog sync step
 
-	logger.Println("start sync oplog")
-	oplogSync := NewOplogSync(initColl)
-	oplogSync.Run()
+    if isTokumx == false {
+	    logger.Println("start sync oplog")
+	    oplogSync := NewOplogSync(initColl)
+	    oplogSync.Run()
+    } else {
+        logger.Println("skip sync oplog.")
+    }
 
 }
